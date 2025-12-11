@@ -53,9 +53,6 @@ class HMMStandardStrategy:
         df.loc[df['Regime'] == 0, 'Signal'] = 1   # 低波 -> Long
         df.loc[df['Regime'] == self.n_components-1, 'Signal'] = -1 # 高波 -> Short
         
-        # 辅助信息：置信度 (简化版，直接用Regime代替)
-        df['Signal_Strength'] = "N/A" # 经典模型不计算置信度
-        
         return df
 
 class HMMAdaptiveStrategy:
@@ -84,12 +81,10 @@ class HMMAdaptiveStrategy:
         
         hidden_states = model.predict(X)
         
-        # 排序
         state_vol_means = [X[hidden_states == i, 1].mean() for i in range(self.n_components)]
         sorted_stats = sorted(list(enumerate(state_vol_means)), key=lambda x: x[1])
         mapping = {old: new for new, (old, _) in enumerate(sorted_stats)}
         
-        # 后验概率
         posterior_probs = model.predict_proba(X)
         sorted_probs = np.zeros_like(posterior_probs)
         for old_i, new_i in mapping.items():
@@ -97,11 +92,9 @@ class HMMAdaptiveStrategy:
             
         df['Regime'] = np.array([mapping[s] for s in hidden_states])
         
-        # 记录每个状态的概率用于展示
         for i in range(self.n_components):
             df[f'Prob_S{i}'] = sorted_probs[:, i]
         
-        # 贝叶斯预测
         state_means = []
         for i in range(self.n_components):
             mean_ret = df[df['Regime'] == i]['Log_Ret'].mean()
@@ -115,8 +108,74 @@ class HMMAdaptiveStrategy:
         next_probs = np.dot(sorted_probs, new_transmat)
         df['Bayes_Exp_Ret'] = np.dot(next_probs, state_means)
         
-        # 信号生成
         threshold = 0.0003
+        df['Signal'] = 0
+        df.loc[df['Bayes_Exp_Ret'] > threshold, 'Signal'] = 1
+        df.loc[df['Bayes_Exp_Ret'] < -threshold, 'Signal'] = -1
+        
+        return df
+
+class HMMIntradayStrategy:
+    """
+    [新增] 高频微观结构策略 (Tick/Intraday)
+    特点：特征放大倍数更高，阈值更低，关注微观流动性与波动率聚类
+    """
+    def __init__(self, n_components=3, iter_num=1000, window_size=24):
+        self.n_components = n_components
+        self.iter_num = iter_num
+        self.window_size = window_size # 24个5min K线 ≈ 2小时
+
+    def generate_signals(self, df):
+        df = df.copy()
+        df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+        df['Volatility'] = df['Log_Ret'].rolling(window=self.window_size).std()
+        df.dropna(inplace=True)
+        
+        if len(df) < 100: return df
+        
+        # 高频数据数值极小，必须大幅 Scale 以防矩阵奇异
+        X = df[['Log_Ret', 'Volatility']].values * 1000.0
+        
+        try:
+            # 增加 min_covar 鲁棒性
+            model = GaussianHMM(n_components=self.n_components, covariance_type="full", n_iter=self.iter_num, random_state=42, tol=0.01, min_covar=0.1)
+            model.fit(X)
+        except:
+            st.warning("HMM 模型训练失败 (Intraday)")
+            return df
+        
+        hidden_states = model.predict(X)
+        
+        state_vol_means = [X[hidden_states == i, 1].mean() for i in range(self.n_components)]
+        sorted_stats = sorted(list(enumerate(state_vol_means)), key=lambda x: x[1])
+        mapping = {old: new for new, (old, _) in enumerate(sorted_stats)}
+        
+        posterior_probs = model.predict_proba(X)
+        sorted_probs = np.zeros_like(posterior_probs)
+        for old_i, new_i in mapping.items():
+            sorted_probs[:, new_i] = posterior_probs[:, old_i]
+            
+        df['Regime'] = np.array([mapping[s] for s in hidden_states])
+        
+        for i in range(self.n_components):
+            df[f'Prob_S{i}'] = sorted_probs[:, i]
+        
+        # 贝叶斯期望
+        state_means = []
+        for i in range(self.n_components):
+            mean_ret = df[df['Regime'] == i]['Log_Ret'].mean()
+            state_means.append(mean_ret)
+        
+        new_transmat = np.zeros_like(model.transmat_)
+        for i in range(self.n_components):
+            for j in range(self.n_components):
+                new_transmat[mapping[i], mapping[j]] = model.transmat_[i, j]
+        
+        next_probs = np.dot(sorted_probs, new_transmat)
+        df['Bayes_Exp_Ret'] = np.dot(next_probs, state_means)
+        
+        # 微观信号阈值 (更敏感)
+        threshold = 0.0002 # 2bps
         df['Signal'] = 0
         df.loc[df['Bayes_Exp_Ret'] > threshold, 'Signal'] = 1
         df.loc[df['Bayes_Exp_Ret'] < -threshold, 'Signal'] = -1
@@ -144,8 +203,8 @@ class SpreadArbStrategy:
         data['Z_Score'] = (data['Spread'] - data['Spread_Mean']) / (data['Spread_Std'] + 1e-8)
         
         data['Signal'] = 0
-        data.loc[data['Z_Score'] > self.z_threshold, 'Signal'] = -1 # 卖价差 (做空 Spread)
-        data.loc[data['Z_Score'] < -self.z_threshold, 'Signal'] = 1 # 买价差 (做多 Spread)
+        data.loc[data['Z_Score'] > self.z_threshold, 'Signal'] = -1 
+        data.loc[data['Z_Score'] < -self.z_threshold, 'Signal'] = 1 
         
         ret_a = np.log(data['Price_A'] / data['Price_A'].shift(1)).fillna(0)
         ret_b = np.log(data['Price_B'] / data['Price_B'].shift(1)).fillna(0)
@@ -185,10 +244,20 @@ class BacktestEngine:
         start_val = equity.iloc[0] if equity.iloc[0] > 0 else self.initial_capital
         total_ret = (equity.iloc[-1] / start_val) - 1
         
-        days = (equity.index[-1] - equity.index[0]).days
-        cagr = (1 + total_ret) ** (365 / days) - 1 if days > 0 else 0
-        vol = ret.std() * np.sqrt(252)
-        sharpe = (ret.mean() * 252) / (vol + 1e-8) if vol > 0 else 0
+        # 估算年化 (兼容 Intraday)
+        # 如果是日线，差值是 days；如果是 5min，需要换算
+        time_span = df.index[-1] - df.index[0]
+        days = time_span.days + (time_span.seconds / 86400)
+        
+        cagr = (1 + total_ret) ** (365 / days) - 1 if days > 0.5 else 0
+        
+        # 夏普 (粗略估计)
+        # 对于 Intraday，252 不再适用，这里根据 K 线数量反推 freq
+        bars_per_day = len(df) / (days if days > 0 else 1)
+        annual_factor = 252 if bars_per_day < 2 else 252 * bars_per_day 
+        
+        vol = ret.std() * np.sqrt(annual_factor)
+        sharpe = (ret.mean() * annual_factor) / (vol + 1e-8) if vol > 0 else 0
         
         roll_max = equity.cummax()
         dd = (equity - roll_max) / (roll_max + 1e-8)
@@ -213,15 +282,11 @@ class BacktestEngine:
 # ==========================================
 
 def display_signal_panel(df, strategy_type):
-    """
-    智能信号驾驶舱
-    """
     last = df.iloc[-1]
     sig = last['Signal']
     
     st.markdown("### 🚦 实时交易信号驾驶舱")
     
-    # 1. 信号大卡片
     col_sig, col_reason = st.columns([1, 2])
     
     with col_sig:
@@ -232,52 +297,34 @@ def display_signal_panel(df, strategy_type):
         else:
             st.warning("## ⚪ 空仓观望\n**WAIT / CASH**")
             
-    # 2. 深度逻辑解读
     with col_reason:
         st.markdown("#### 🤖 策略逻辑分析")
         
-        if "自适应" in strategy_type:
+        if "自适应" in strategy_type or "微观" in strategy_type:
             prob_0 = last.get('Prob_S0', 0) * 100
             prob_2 = last.get('Prob_S2', 0) * 100
-            exp_ret = last.get('Bayes_Exp_Ret', 0) * 100
+            exp_ret = last.get('Bayes_Exp_Ret', 0) 
             
-            regime_desc = "低波动 (通常利多)" if last['Regime'] == 0 else ("高波动 (风险极大)" if last['Regime'] == 2 else "震荡过渡期")
+            # 单位显示优化
+            exp_ret_disp = f"{exp_ret*100:.4f}%" if "微观" not in strategy_type else f"{exp_ret*10000:.2f} bps"
+            
+            regime_desc = "低波动" if last['Regime'] == 0 else ("高波动" if last['Regime'] == 2 else "震荡")
             
             msg = f"""
             - **当前体制**: State {int(last['Regime'])} ({regime_desc})
-            - **概率置信度**: State 0 (牛): **{prob_0:.1f}%** | State 2 (熊): **{prob_2:.1f}%**
-            - **贝叶斯期望**: 下一日预期收益为 **{exp_ret:.4f}%**
+            - **概率置信**: 牛(S0): **{prob_0:.1f}%** | 熊(S2): **{prob_2:.1f}%**
+            - **贝叶斯期望**: 下一周期预期收益 **{exp_ret_disp}**
             """
-            if sig == 1:
-                msg += "\n\n💡 **结论**: 市场虽有波动，但数学期望收益显著为正，建议**持有或加仓**。"
-            elif sig == -1:
-                msg += "\n\n💡 **结论**: 高波动伴随负收益预期，系统检测到**崩盘风险**，建议清仓。"
-            else:
-                msg += "\n\n💡 **结论**: 预期收益微弱，不足以覆盖交易成本，建议**观望**。"
             st.info(msg)
             
         elif "套利" in strategy_type:
             z_score = last.get('Z_Score', 0)
             spread = last.get('Spread', 0)
-            
-            msg = f"""
-            - **当前价差**: {spread:.2f}
-            - **偏离度 (Z-Score)**: **{z_score:.2f} σ** (标准差)
-            """
-            if sig == 1:
-                msg += "\n\n💡 **结论**: 价差过度收缩 (Z < -1.5)，统计学上大概率将**反弹扩大**。建议：买入价差组合。"
-            elif sig == -1:
-                msg += "\n\n💡 **结论**: 价差过度扩张 (Z > 1.5)，统计学上大概率将**回归均值**。建议：卖出价差组合。"
-            else:
-                msg += "\n\n💡 **结论**: 价差处于合理区间 (-1.5 ~ 1.5)，无明显套利机会。"
+            msg = f"""- **当前价差**: {spread:.2f}\n- **偏离度 (Z-Score)**: **{z_score:.2f} σ**"""
             st.info(msg)
-            
-        else: # Standard
+        else:
             regime = int(last['Regime'])
-            msg = f"- **当前体制**: State {regime}"
-            if regime == 0: msg += " (低波稳健期) -> **做多**"
-            elif regime == 2: msg += " (高波恐慌期) -> **做空**"
-            else: msg += " (震荡期) -> **空仓**"
+            msg = f"- **当前体制**: State {regime} (静态规则)"
             st.info(msg)
 
 # ==========================================
@@ -289,9 +336,11 @@ st.set_page_config(page_title="能源量化终端 Pro+", layout="wide", page_ico
 st.title("⚡ Energy Quant Lab: HMM & Arbitrage System (Pro+)")
 st.markdown("### 专业的能源市场量化回测与信号平台")
 
-# 侧边栏
 st.sidebar.header("⚙️ 策略控制台")
-strategy_type = st.sidebar.selectbox("选择策略类型", ["HMM 自适应贝叶斯 (Adaptive)", "HMM 经典模型 (Standard)", "统计套利 (Pairs Trading)"])
+strategy_type = st.sidebar.selectbox(
+    "选择策略类型",
+    ["HMM 自适应贝叶斯 (Adaptive)", "HMM 高频微观模型 (Intraday Tick)", "HMM 经典模型 (Standard)", "统计套利 (Pairs Trading)"]
+)
 
 tickers = {"Brent Crude": "BZ=F", "WTI Crude": "CL=F", "Natural Gas (HH)": "NG=F", "Dutch TTF": "TTF=F"}
 
@@ -304,34 +353,42 @@ else:
     asset = st.sidebar.selectbox("选择交易标的", list(tickers.keys()))
     ticker = tickers[asset]
 
-start_date = st.sidebar.date_input("回测开始", datetime.now() - timedelta(days=365*2))
-end_date = st.sidebar.date_input("回测结束", datetime.now())
+# 根据策略类型动态调整日期选择器
+if "微观" in strategy_type:
+    st.sidebar.info("⏱️ 高频模式：自动获取最近 5 天的 5分钟 K线")
+    start_date = None
+    end_date = None
+else:
+    start_date = st.sidebar.date_input("回测开始", datetime.now() - timedelta(days=365*2))
+    end_date = st.sidebar.date_input("回测结束", datetime.now())
 
 if st.sidebar.button("🚀 运行分析", type="primary"):
-    engine = BacktestEngine(initial_capital=100000)
+    # 高频模式手续费更低 (假设)
+    cost = 0.0001 if "微观" in strategy_type else 0.0002
+    engine = BacktestEngine(initial_capital=100000, transaction_cost=cost)
     
     with st.spinner(f"正在计算 {ticker} 的量化信号..."):
         try:
+            # --- 数据获取分支 ---
             if "套利" in strategy_type:
                 df_a = yf.download(tickers[asset_a], start=start_date, end=end_date, progress=False, auto_adjust=True)
                 df_b = yf.download(tickers[asset_b], start=start_date, end=end_date, progress=False, auto_adjust=True)
-                # 兼容性处理
                 if isinstance(df_a.columns, pd.MultiIndex): df_a.columns = df_a.columns.get_level_values(0)
                 if isinstance(df_b.columns, pd.MultiIndex): df_b.columns = df_b.columns.get_level_values(0)
 
                 if df_a.empty or df_b.empty:
-                    st.error("数据获取失败。")
+                    st.error("数据不足。")
                 else:
                     strat = SpreadArbStrategy()
                     df_res = strat.generate_signals(df_a, df_b)
                     if len(df_res) > 0:
-                        # 1. 信号驾驶舱 (最优先展示)
                         display_signal_panel(df_res, strategy_type)
                         st.divider()
                         
-                        # 2. 回测结果
                         df_bt = engine.run(df_res, ret_col='Spread_Ret_Raw')
                         metrics = engine.calculate_metrics(df_bt)
+                        
+                        # KPI Display
                         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
                         kpi1.metric("总回报", metrics['Total Return'])
                         kpi2.metric("年化收益", metrics['CAGR'])
@@ -339,7 +396,6 @@ if st.sidebar.button("🚀 运行分析", type="primary"):
                         kpi4.metric("最大回撤", metrics['Max Drawdown'])
                         kpi5.metric("胜率", metrics['Win Rate'])
                         
-                        # 3. 图表
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Equity_Curve'], name="Strategy Equity", line=dict(color='cyan', width=2)))
                         fig.update_layout(title="套利净值曲线", height=400, template="plotly_dark")
@@ -349,9 +405,62 @@ if st.sidebar.button("🚀 运行分析", type="primary"):
                         fig2.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Z_Score'], name="Spread Z-Score", line=dict(color='yellow')))
                         fig2.add_hline(y=1.5, line_dash="dash", line_color="red")
                         fig2.add_hline(y=-1.5, line_dash="dash", line_color="green")
-                        fig2.update_layout(title="价差 Z-Score 监控", height=300, template="plotly_dark")
+                        fig2.update_layout(title="价差 Z-Score", height=300, template="plotly_dark")
                         st.plotly_chart(fig2, use_container_width=True)
+
+            elif "微观" in strategy_type:
+                # Intraday Data Fetching
+                df = yf.download(tickers[asset], period="5d", interval="5m", progress=False, auto_adjust=True)
+                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                
+                if df.empty:
+                    st.error("无法获取高频数据。")
+                else:
+                    strat = HMMIntradayStrategy()
+                    df_res = strat.generate_signals(df)
+                    
+                    if 'Signal' in df_res.columns:
+                        display_signal_panel(df_res, strategy_type)
+                        st.divider()
+                        
+                        df_bt = engine.run(df_res, ret_col='Log_Ret')
+                        metrics = engine.calculate_metrics(df_bt)
+                        
+                        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+                        kpi1.metric("本周回报", metrics['Total Return'])
+                        kpi2.metric("年化(估算)", metrics['CAGR'])
+                        kpi3.metric("伪夏普", metrics['Sharpe Ratio'])
+                        kpi4.metric("最大回撤", metrics['Max Drawdown'])
+                        kpi5.metric("胜率", metrics['Win Rate'])
+                        
+                        # Charts
+                        tab1, tab2 = st.tabs(["📈 分时图与信号", "🔬 详细 Tick 数据"])
+                        with tab1:
+                            fig = go.Figure()
+                            # Price
+                            fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Close'], name="Price", line=dict(color='white', width=1)))
+                            # Signals
+                            buy_sig = df_bt[df_bt['Signal'] == 1]
+                            sell_sig = df_bt[df_bt['Signal'] == -1]
+                            fig.add_trace(go.Scatter(x=buy_sig.index, y=buy_sig['Close'], mode='markers', marker=dict(symbol='triangle-up', color='lime', size=8), name='Buy'))
+                            fig.add_trace(go.Scatter(x=sell_sig.index, y=sell_sig['Close'], mode='markers', marker=dict(symbol='triangle-down', color='red', size=8), name='Sell'))
+                            
+                            fig.update_layout(title="5分钟 K线与交易点位", height=500, template="plotly_dark")
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Prob Flow
+                            if 'Prob_S0' in df_bt.columns:
+                                fig2 = go.Figure()
+                                fig2.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Prob_S0'], stackgroup='one', name='Prob Low Vol', line=dict(width=0, color='rgba(0,255,0,0.3)')))
+                                fig2.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Prob_S2'], stackgroup='one', name='Prob High Vol', line=dict(width=0, color='rgba(255,0,0,0.3)')))
+                                fig2.update_layout(title="微观体制概率流 (Probability Flow)", height=300, template="plotly_dark")
+                                st.plotly_chart(fig2, use_container_width=True)
+                        
+                        with tab2:
+                            st.dataframe(df_bt.tail(100).sort_index(ascending=False))
+
             else:
+                # Daily Strategy
                 df = yf.download(tickers[asset], start=start_date, end=end_date, progress=False, auto_adjust=True)
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 
@@ -366,13 +475,12 @@ if st.sidebar.button("🚀 运行分析", type="primary"):
                     df_res = strat.generate_signals(df)
                     
                     if 'Signal' in df_res.columns:
-                        # 1. 信号驾驶舱
                         display_signal_panel(df_res, strategy_type)
                         st.divider()
                         
-                        # 2. 回测结果
                         df_bt = engine.run(df_res, ret_col='Log_Ret')
                         metrics = engine.calculate_metrics(df_bt)
+                        
                         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
                         kpi1.metric("总回报", metrics['Total Return'])
                         kpi2.metric("年化收益", metrics['CAGR'])
@@ -380,19 +488,12 @@ if st.sidebar.button("🚀 运行分析", type="primary"):
                         kpi4.metric("最大回撤", metrics['Max Drawdown'])
                         kpi5.metric("胜率", metrics['Win Rate'])
                         
-                        # 3. 图表
-                        tab1, tab2 = st.tabs(["📈 净值与信号", "🔬 详细数据"])
+                        tab1, tab2 = st.tabs(["📈 净值与体制", "🔬 详细数据"])
                         with tab1:
                             fig = go.Figure()
                             fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Equity_Curve'], name="Strategy Equity", line=dict(color='cyan', width=2)))
                             fig.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Benchmark_Curve'], name="Buy & Hold", line=dict(color='gray', dash='dot')))
-                            
-                            buy_sig = df_bt[df_bt['Signal'] == 1]
-                            sell_sig = df_bt[df_bt['Signal'] == -1]
-                            fig.add_trace(go.Scatter(x=buy_sig.index, y=buy_sig['Equity_Curve'], mode='markers', marker=dict(symbol='triangle-up', color='lime', size=10), name='Buy Signal'))
-                            fig.add_trace(go.Scatter(x=sell_sig.index, y=sell_sig['Equity_Curve'], mode='markers', marker=dict(symbol='triangle-down', color='red', size=10), name='Sell Signal'))
-                            
-                            fig.update_layout(title="策略净值曲线", height=500, template="plotly_dark")
+                            fig.update_layout(title="策略净值曲线", height=400, template="plotly_dark")
                             st.plotly_chart(fig, use_container_width=True)
                             
                             if 'Regime' in df_bt.columns:
@@ -406,8 +507,6 @@ if st.sidebar.button("🚀 运行分析", type="primary"):
                                 st.plotly_chart(fig2, use_container_width=True)
                         with tab2:
                             st.dataframe(df_bt.tail(100).sort_index(ascending=False))
-                    else:
-                        st.warning("信号生成失败，可能是数据量不足。")
 
         except Exception as e:
             st.error(f"运行出错: {e}")
