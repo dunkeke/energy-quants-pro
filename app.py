@@ -5,6 +5,7 @@ import yfinance as yf
 from hmmlearn.hmm import GaussianHMM
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from datetime import datetime, timedelta  # [修复] 补全核心时间库
 import warnings
 
 # 忽略部分 sklearn 警告
@@ -23,6 +24,7 @@ class HMMStandardStrategy:
 
     def generate_signals(self, df):
         df = df.copy()
+        # 计算收益率和波动率
         df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
         df['Volatility'] = df['Log_Ret'].rolling(window=self.window_size).std()
         df.dropna(inplace=True)
@@ -179,7 +181,9 @@ class BacktestEngine:
         fees = trades * self.cost
         
         # 3. 策略收益 (填充 NaN 以防计算断裂)
+        # 确保收益率列没有 NaN
         df[ret_col] = df[ret_col].fillna(0)
+        
         df['Strategy_Ret'] = (df['Position'] * df[ret_col]) - fees
         
         # 4. 净值曲线 (起点归一化)
